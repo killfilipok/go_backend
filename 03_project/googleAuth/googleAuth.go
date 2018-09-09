@@ -1,8 +1,8 @@
-package googleAuth
+//Package googleauth is puckage for google auth api
+package googleauth
 
 import (
 	"crypto/rand"
-	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -11,8 +11,12 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/killfilipok/backend_stuff/03_project/imageservice"
+
 	"github.com/dchest/uniuri"
+	jwt "github.com/dgrijalva/jwt-go"
 	"github.com/gin-gonic/contrib/sessions"
+	"github.com/killfilipok/backend_stuff/03_project/database"
 	"github.com/killfilipok/backend_stuff/03_project/mySqlFuncs"
 	"github.com/killfilipok/backend_stuff/03_project/structs"
 	"golang.org/x/crypto/bcrypt"
@@ -20,7 +24,6 @@ import (
 	"golang.org/x/oauth2/google"
 )
 
-var db *sql.DB
 var cred structs.Credentials
 var conf *oauth2.Config
 var state string
@@ -32,7 +35,7 @@ func randToken() string {
 	return base64.StdEncoding.EncodeToString(b)
 }
 
-func Init(DB *sql.DB) {
+func init() {
 	file, err := ioutil.ReadFile("./creds.json")
 	if err != nil {
 		log.Printf("File error: %v\n", err)
@@ -40,7 +43,6 @@ func Init(DB *sql.DB) {
 	}
 	json.Unmarshal(file, &cred)
 
-	db = DB
 	conf = &oauth2.Config{
 		ClientID:     cred.Cid,
 		ClientSecret: cred.Csecret,
@@ -56,6 +58,7 @@ func getLoginURL(state string) string {
 	return conf.AuthCodeURL(state)
 }
 
+//CallbackHandler handle response from google
 func CallbackHandler(w http.ResponseWriter, r *http.Request) {
 	code := r.FormValue("code")
 	token, _ := conf.Exchange(oauth2.NoContext, code)
@@ -77,12 +80,12 @@ func CallbackHandler(w http.ResponseWriter, r *http.Request) {
 	// fmt.Println(user)
 
 	var hashedPassword []byte
-	if mySqlFuncs.RowExists("select uid from users where uid=$1", db, user.ID) {
-		result := db.QueryRow("select * from users where uid=$1", user.ID)
+	if mySqlFuncs.RowExists("select uid from users where uid=$1", user.ID) {
+		result := database.DBCon.QueryRow("select * from users where uid=$1", user.ID)
 
 		userObj := structs.User{}
 
-		err = result.Scan(&userObj.Username, &userObj.Password, &userObj.Uid)
+		err = result.Scan(&userObj.Username, &userObj.Password, &userObj.Uid, nil)
 		fmt.Println("SignIn with google")
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -95,7 +98,7 @@ func CallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 		hashedPassword = res
 		fmt.Println("SignUp with google")
-		if _, err = db.Query("insert into users values ($1, $2, $3)", user.Email, string(hashedPassword), user.ID); err != nil {
+		if _, err = database.DBCon.Query("insert into users values ($1, $2, $3)", user.Email, string(hashedPassword), user.ID); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			fmt.Println("SignUp with google")
 			return
@@ -103,9 +106,29 @@ func CallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-	mySqlFuncs.SendUserObjBack(structs.User{user.Email, string(hashedPassword), user.ID}, w, db)
+	resp, err := http.Get(user.Picture)
+
+	if err != nil {
+		log.Fatal("Trouble making REST GET request!")
+	}
+
+	defer resp.Body.Close()
+
+	contents, err = ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatal("Trouble reading JSON response body!")
+	}
+
+	imageUrl := imageservice.SaveImg(contents, w, user.ID)
+
+	tk := &structs.Token{UserId: user.ID}
+	resTk := jwt.NewWithClaims(jwt.GetSigningMethod("HS256"), tk)
+	tokenString, _ := resTk.SignedString([]byte(os.Getenv("token_password")))
+
+	mySqlFuncs.SendObjBack(structs.User{user.Email, string(hashedPassword), user.ID, tokenString, imageUrl, ""}, w)
 }
 
+//LoginHandler redirects user to google api for auth
 func LoginHandler(w http.ResponseWriter, r *http.Request) {
 	oauthStateString := uniuri.New()
 	url := conf.AuthCodeURL(oauthStateString)
